@@ -1,33 +1,7 @@
 # Financial Statement Parser
 
 <div align="center">
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240">
-    <!-- Clean white background with rounded corners -->
-    <rect width="240" height="240" rx="20" fill="#ffffff" />
-    
-    <!-- Primary Document -->
-    <rect x="50" y="60" width="120" height="130" rx="8" fill="#ffffff" stroke="#2c3e50" stroke-width="3" />
-    
-    <!-- Document lines (simplified) -->
-    <line x1="70" y1="85" x2="150" y2="85" stroke="#2c3e50" stroke-width="3" />
-    <line x1="70" y1="105" x2="130" y2="105" stroke="#2c3e50" stroke-width="3" />
-    <line x1="70" y1="125" x2="140" y2="125" stroke="#2c3e50" stroke-width="3" />
-    
-    <!-- Simplified transaction entries -->
-    <rect x="70" y="145" width="80" height="12" rx="2" fill="#e6e6e6" />
-    <rect x="70" y="165" width="80" height="12" rx="2" fill="#e6e6e6" />
-    
-    <!-- Simplified data extraction arrow -->
-    <polygon points="170,110 190,110 190,100 210,120 190,140 190,130 170,130" fill="#7f79ec" />
-    
-    <!-- Standard dollar sign in a circle -->
-    <circle cx="180" cy="160" r="20" fill="#7f79ec" />
-    <text x="180" y="168" font-family="Arial, sans-serif" font-size="30" font-weight="bold" text-anchor="middle" fill="#ffffff">$</text>
-    
-    <!-- Brand text (clean, simple) -->
-    <text x="120" y="215" font-family="Arial, sans-serif" font-size="18" font-weight="bold" text-anchor="middle" fill="#2c3e50">FinStatement</text>
-    <text x="120" y="235" font-family="Arial, sans-serif" font-size="18" font-weight="bold" text-anchor="middle" fill="#2c3e50">Parser</text>
-  </svg>
+  <img src="logo.png" />
   <br>
   <strong>Extract structured data from financial statement PDFs</strong>
   <br>
