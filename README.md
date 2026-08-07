@@ -11,7 +11,7 @@
 <br>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![PyPI version](https://img.shields.io/badge/PyPI-v0.1.0-blue.svg)](https://pypi.org/project/finstatement/)
+[![Status: reference implementation](https://img.shields.io/badge/status-reference%20implementation-lightgrey.svg)](#status)
 [![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
 
 ## The Problem
@@ -40,14 +40,12 @@ This library provides a standardized way to extract structured data from financi
 ### Installation
 
 ```bash
-# From PyPI (once published)
-pip install finstatement
-
-# From source
-git clone https://github.com/azdv/finstatement.git
-cd finstatement
+git clone https://github.com/AZdv/finstatement-parser.git
+cd finstatement-parser
 pip install -e .
 ```
+
+This package is **not published to PyPI**. Install from source.
 
 ### Basic Usage
 
@@ -152,9 +150,8 @@ The library currently supports basic extraction for statements from:
 - Citibank
 - American Express
 - Discover
-- Capital One
 
-More institutions and statement types are being added regularly.
+Coverage varies by institution and statement layout. Treat the list above as "has been exercised against real statements", not as a compatibility guarantee.
 
 ## Data Model
 
@@ -190,6 +187,13 @@ StatementResult
 - **Financial Analysis Tools**: Import historical statement data
 - **Loan Processing Systems**: Analyze bank statements for affordability checks
 
+## Status
+
+This is a reference implementation, not a supported product. It is published so
+the approach can be read and reused, and it is not on PyPI. Issues and pull
+requests are reviewed periodically rather than on a schedule. Corrections that
+come with a failing example are the fastest thing to get merged.
+
 ## Contributing
 
 Contributions are welcome! Here's how you can help:
@@ -213,19 +217,8 @@ Please see [CONTRIBUTING.md](CONTRIBUTING.md) for detailed contribution guidelin
 
 ## Performance
 
-The library is optimized for accuracy rather than speed but can still process most statements in under a second. For large batches of statements, consider using the `batch_parse` function with parallel processing enabled.
+The library is optimized for accuracy rather than speed. For large batches, `batch_parse` supports parallel processing. No benchmark figures are published here because none have been measured under a documented methodology.
 
-### Benchmarks
-
-| Statement Type | Pages | Processing Time (s) |
-|----------------|-------|---------------------|
-| Chase Credit Card | 3 | 0.42 |
-| Bank of America Checking | 5 | 0.67 |
-| Wells Fargo Savings | 2 | 0.35 |
-| Amex Credit Card | 8 | 0.98 |
-| Batch of 10 statements | 35 | 3.12* |
-
-_* Using parallel processing on a quad-core system_
 
 ## Troubleshooting
 
