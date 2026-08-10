@@ -207,6 +207,8 @@ a lot of extraction code:
 | the closing balance | `0.0` | `None`, recorded in `parse_errors` |
 | a transaction date | today's date | the row is dropped and recorded |
 | a `MM/DD` date with no year | the year the code was run | the year from the statement period, or the row is dropped |
+| the account number | the sentinel string `"Unknown"`, with nothing in `parse_errors` | `None`, recorded in `parse_errors` |
+| a partial account number | padded into `xxxx-xxxx-xxxx-1234`, inventing a 16-digit card shape even for a checking account | the digits actually captured, with `number_is_partial` set |
 
 The old confidence scores made it worse rather than catching it. A fabricated
 `0.00` balance scored `0.8`, and thirty transactions all stamped with today
