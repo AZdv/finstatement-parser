@@ -399,18 +399,34 @@ class StatementParser:
         return Period(start=None, end=None)
 
     @staticmethod
-    def _statement_year(period: Period) -> Optional[int]:
+    def _resolve_md(month_day: str, period: Period, sep: str = "/") -> Optional[datetime]:
         """
-        The year to assume for transaction dates written as MM/DD.
+        Resolve a MM/DD transaction date against the statement period.
 
-        Taken from the statement period, never from the clock. Using
-        datetime.now().year meant a January 2025 statement parsed in 2026 came
-        back with every transaction dated 2026, wrong in the direction nobody
-        checks. Returns None when the period is unknown, and the caller drops
-        the row rather than guessing.
+        Two earlier versions of this were both wrong. The first used
+        datetime.now().year, so a 2024 statement parsed in 2026 came back dated
+        2026. The second used the period's END year, which is wrong for every
+        statement that crosses New Year: on a 15 Dec 2024 to 14 Jan 2025 cycle,
+        a 12/20 transaction became 2025-12-20, eleven months into the future.
+        December-to-January cycles are routine, so that was not an edge case.
+
+        Both candidate years are tried and the one that lands inside the period
+        wins. If neither fits, or the period is unknown, this returns None and
+        the caller drops the row rather than guessing a third time.
         """
-        anchor = period.end or period.start
-        return anchor.year if anchor else None
+        if not (period.start and period.end):
+            return None
+        fmt = f"%m{sep}%d{sep}%Y"
+        fits = []
+        for year in {period.start.year, period.end.year}:
+            try:
+                d = datetime.strptime(f"{month_day}{sep}{year}", fmt)
+            except ValueError:
+                continue
+            if period.start <= d <= period.end:
+                fits.append(d)
+        # Exactly one candidate inside the period is the only unambiguous case.
+        return fits[0] if len(fits) == 1 else None
 
     @staticmethod
     def _parse_date(value: str) -> Optional[datetime]:
@@ -529,13 +545,13 @@ class StatementParser:
             for match in re.finditer(tx_pattern, transaction_section):
                 date_str, description, amount_str = match.groups()
                 
-                year = self._statement_year(period)
-                if year is None:
+                date = self._resolve_md(date_str, period)
+                if date is None:
                     self._errors.append(
                         f"skipped transaction {date_str!r} {description.strip()!r}: the "
-                        f"date carries no year and the statement period is unknown")
+                        f"date carries no year and could not be placed unambiguously "
+                        f"inside the statement period")
                     continue
-                date = datetime.strptime(f"{date_str}/{year}", "%m/%d/%Y")
                 
                 # Parse amount
                 amount = float(amount_str.replace('$', '').replace(',', ''))
@@ -616,12 +632,11 @@ class StatementParser:
                                 except ValueError:
                                     date = datetime.strptime(date_str, "%m/%d/%y")
                             else:
-                                year = self._statement_year(period)
-                                if year is None:
+                                date = self._resolve_md(date_str, period, "/")
+                                if date is None:
                                     raise ValueError(
-                                        "date carries no year and the statement "
-                                        "period is unknown")
-                                date = datetime.strptime(f"{date_str}/{year}", "%m/%d/%Y")
+                                        "date carries no year and could not be placed "
+                                        "inside the statement period")
                         else:
                             # Handle dashes
                             if len(date_str.split('-')) > 2:
@@ -631,12 +646,11 @@ class StatementParser:
                                 except ValueError:
                                     date = datetime.strptime(date_str, "%m-%d-%y")
                             else:
-                                year = self._statement_year(period)
-                                if year is None:
+                                date = self._resolve_md(date_str, period, "-")
+                                if date is None:
                                     raise ValueError(
-                                        "date carries no year and the statement "
-                                        "period is unknown")
-                                date = datetime.strptime(f"{date_str}-{year}", "%m-%d-%Y")
+                                        "date carries no year and could not be placed "
+                                        "inside the statement period")
                                 
                     except ValueError as e:
                         # Dropping the row beats stamping it with today. A
