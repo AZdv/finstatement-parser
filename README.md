@@ -187,6 +187,47 @@ StatementResult
 - **Financial Analysis Tools**: Import historical statement data
 - **Loan Processing Systems**: Analyze bank statements for affordability checks
 
+## What it does when it cannot read something
+
+This matters more than the happy path, so it is documented before the features.
+
+The parser does not guess. If a field cannot be read it comes back as `None`,
+the reason is appended to `result.parse_errors`, and the confidence score for
+that field is `0.0`. If the file cannot be read at all it raises
+`StatementParseError` rather than returning an empty result.
+
+That is a deliberate reversal. An earlier version of this code did the opposite
+and it was wrong in a way worth describing, because the same pattern shows up in
+a lot of extraction code:
+
+| When it could not read | It used to return | It now returns |
+|---|---|---|
+| the PDF at all | the string `"ERROR: Unable to extract text from PDF"`, parsed as if it were statement text | raises `StatementParseError` |
+| the statement period | the current calendar month | `None`, recorded in `parse_errors` |
+| the closing balance | `0.0` | `None`, recorded in `parse_errors` |
+| a transaction date | today's date | the row is dropped and recorded |
+| a `MM/DD` date with no year | the year the code was run | the year from the statement period, or the row is dropped |
+
+The old confidence scores made it worse rather than catching it. A fabricated
+`0.00` balance scored `0.8`, and thirty transactions all stamped with today
+scored `0.9`, because the score counted rows instead of measuring what was
+known. Wrong figures carrying a high confidence score are worse than an error.
+
+```python
+result = finstatement.parse("statement.pdf")
+
+if result.parse_errors:
+    for problem in result.parse_errors:
+        print(problem)
+
+if result.balance.closing is None:
+    ...  # not zero. unknown.
+```
+
+Untrusted PDFs are bounded: 50 MB and 500 pages by default, and an encrypted
+file that will not open with an empty password raises rather than returning
+whatever fragments came out.
+
 ## Status
 
 This is a reference implementation, not a supported product. It is published so
