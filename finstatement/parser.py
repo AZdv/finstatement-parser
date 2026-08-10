@@ -38,7 +38,14 @@ class StatementParseError(Exception):
 @dataclass
 class AccountInfo:
     """Account information extracted from a financial statement."""
-    number: str
+    # None when it could not be read, consistent with every other field. The
+    # earlier "Unknown" sentinel was returned with no parse_errors entry, so the
+    # documented contract said None and the code said otherwise.
+    number: Optional[str] = None
+    # True when `number` holds only the trailing digits the statement exposed.
+    # The earlier code expanded a 4-digit capture into "xxxx-xxxx-xxxx-1234",
+    # inventing a 16-digit card shape even for a checking account.
+    number_is_partial: bool = False
     name: Optional[str] = None
     institution: Optional[str] = None
     type: Optional[str] = None
@@ -300,7 +307,8 @@ class StatementParser:
             AccountInfo object with extracted account details
         """
         # Default account number if none is found
-        account_number = "Unknown"
+        account_number = None
+        number_is_partial = False
         account_name = None
         
         # Look for account number patterns
@@ -315,7 +323,10 @@ class StatementParser:
             for pattern in account_patterns:
                 account_matches = re.search(pattern, text)
                 if account_matches:
-                    account_number = f"xxxx-xxxx-xxxx-{account_matches.group(1)}"
+                    # Keep what was actually captured. Do not pad it into a
+                    # shape the statement never showed.
+                    account_number = account_matches.group(1)
+                    number_is_partial = len(account_number) <= 4
                     break
             
             # Try to extract account name if present
@@ -330,8 +341,12 @@ class StatementParser:
                     account_name = name_matches.group(1).strip()
                     break
         
+        if account_number is None:
+            self._errors.append("no account number found")
+
         return AccountInfo(
             number=account_number,
+            number_is_partial=number_is_partial,
             name=account_name,
             institution=institution,
             type=statement_type
@@ -674,7 +689,7 @@ class StatementParser:
         # was a count rather than a measure of what was known.
         # 0.0 rather than 0.3 when the number was never found, so the invariant
         # holds across every field: nothing read means no confidence.
-        confidence["account_info"] = 0.9 if account_info.number != "Unknown" else 0.0
+        confidence["account_info"] = 0.9 if account_info.number is not None else 0.0
 
         if period.start is None or period.end is None:
             confidence["period"] = 0.0
