@@ -9,12 +9,31 @@ information, statement period, balances, and transaction history.
 Developed by AZdev (https://azdv.co)
 """
 
+import os
 import re
 import json
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 import PyPDF2  # For PDF text extraction
+
+# Guardrails for untrusted input. A statement parser is pointed at files that
+# arrived by email, so an unbounded PdfReader call is a denial of service
+# waiting to happen.
+MAX_FILE_BYTES = 50 * 1024 * 1024
+MAX_PAGES = 500
+
+
+class StatementParseError(Exception):
+    """Raised when a statement cannot be read at all.
+
+    This exists because the alternative is worse. An earlier version of this
+    parser caught every exception and returned the string
+    "ERROR: Unable to extract text from PDF" as if it were statement text,
+    which then parsed to a zero balance and a set of transactions dated today.
+    Silence is the wrong default when the output is financial data.
+    """
+
 
 @dataclass
 class AccountInfo:
@@ -26,14 +45,14 @@ class AccountInfo:
     
 @dataclass
 class Period:
-    """Statement period with start and end dates."""
-    start: datetime
-    end: datetime
+    """Statement period. Either bound is None when it could not be read."""
+    start: Optional[datetime] = None
+    end: Optional[datetime] = None
     
 @dataclass
 class Balance:
-    """Statement balances."""
-    closing: float
+    """Statement balances. None means not found, which is not the same as 0.00."""
+    closing: Optional[float] = None
     opening: Optional[float] = None
     
 @dataclass
@@ -53,6 +72,9 @@ class StatementResult:
     balance: Balance
     transactions: List[Transaction]
     confidence: Dict[str, float] = None
+    # Every field this parser could not read, and every transaction line it
+    # skipped. Read this before trusting anything above it.
+    parse_errors: List[str] = field(default_factory=list)
     
     def to_json(self) -> str:
         """
@@ -118,7 +140,12 @@ class StatementParser:
             'transfer': r'(?i)transfer|zelle|venmo|paypal|cash app|wire|ach',
             'withdrawal': r'(?i)withdrawal|atm|cash'
         }
-    
+
+        # Reset per parse() call. Collects every field that could not be read
+        # and every transaction row that was dropped.
+        self._errors = []
+        self._page_errors = []
+
     def parse(self, file_path: str) -> StatementResult:
         """
         Parse a financial statement PDF and return structured data.
@@ -132,8 +159,12 @@ class StatementParser:
         Returns:
             StatementResult object containing parsed data
         """
-        # Extract text from PDF
+        self._errors = []
+        self._page_errors = []
+
+        # Raises StatementParseError if the file cannot be read at all.
         text = self._extract_text(file_path)
+        self._errors.extend(self._page_errors)
         
         # Detect institution and statement type
         institution = self._detect_institution(text)
@@ -143,7 +174,7 @@ class StatementParser:
         account_info = self._extract_account_info(text, institution, statement_type)
         period = self._extract_period(text, institution, statement_type)
         balance = self._extract_balance(text, institution, statement_type)
-        transactions = self._extract_transactions(text, institution, statement_type)
+        transactions = self._extract_transactions(text, institution, statement_type, period)
         
         # Calculate confidence scores for each extraction
         confidence = self._calculate_confidence(account_info, period, balance, transactions)
@@ -154,7 +185,8 @@ class StatementParser:
             period=period,
             balance=balance,
             transactions=transactions,
-            confidence=confidence
+            confidence=confidence,
+            parse_errors=list(self._errors),
         )
     
     def _extract_text(self, file_path: str) -> str:
@@ -170,35 +202,54 @@ class StatementParser:
         Returns:
             Extracted text content as a string
         """
+        size = os.path.getsize(file_path)
+        if size > MAX_FILE_BYTES:
+            raise StatementParseError(
+                f"{file_path} is {size} bytes, over the {MAX_FILE_BYTES} byte limit")
+
         text = ""
+        page_errors = []
         try:
             with open(file_path, 'rb') as file:
                 pdf_reader = PyPDF2.PdfReader(file)
-                
-                # Check if PDF is encrypted and try to decrypt with empty password
+
                 if pdf_reader.is_encrypted:
+                    # An empty password covers the common case of a statement
+                    # encrypted for transport rather than for secrecy.
                     try:
                         pdf_reader.decrypt('')
-                    except:
-                        # If decryption fails, we'll work with whatever we can extract
-                        pass
-                
-                # Extract text from each page with page markers for debugging
-                for page_num in range(len(pdf_reader.pages)):
-                    page = pdf_reader.pages[page_num]
-                    page_text = page.extract_text()
-                    
-                    # Add page delimiter for multi-page analysis
+                    except Exception as e:
+                        raise StatementParseError(
+                            f"{file_path} is encrypted and could not be opened: {e}")
+
+                pages = len(pdf_reader.pages)
+                if pages > MAX_PAGES:
+                    raise StatementParseError(
+                        f"{file_path} has {pages} pages, over the {MAX_PAGES} page limit")
+
+                for page_num in range(pages):
+                    try:
+                        page_text = pdf_reader.pages[page_num].extract_text() or ""
+                    except Exception as e:
+                        # One unreadable page is recoverable. Record it so the
+                        # caller knows the text is incomplete.
+                        page_errors.append(f"page {page_num + 1} unreadable: {e}")
+                        continue
+
                     if page_num > 0:
                         text += f"\n\n--- PAGE {page_num + 1} ---\n\n"
-                    
                     text += page_text
+        except StatementParseError:
+            raise
         except Exception as e:
-            # Provide informative error but continue with partial extraction if possible
-            print(f"Warning: Error extracting text from PDF: {e}")
-            if not text:
-                text = "ERROR: Unable to extract text from PDF"
-        
+            raise StatementParseError(f"could not read {file_path}: {e}") from e
+
+        if not text.strip():
+            raise StatementParseError(
+                f"no text could be extracted from {file_path}. It may be a scan "
+                f"rather than a text PDF, which this parser does not handle.")
+
+        self._page_errors = page_errors
         return text
     
     def _detect_institution(self, text: str) -> str:
@@ -315,28 +366,46 @@ class StatementParser:
                 end_date_str = match.group(2)
                 
                 # Parse dates (try different formats)
-                try:
-                    start_date = datetime.strptime(start_date_str, "%m/%d/%Y")
-                except ValueError:
-                    try:
-                        start_date = datetime.strptime(start_date_str, "%m/%d/%y")
-                    except ValueError:
-                        start_date = datetime.now()  # Fallback
-                    
-                try:
-                    end_date = datetime.strptime(end_date_str, "%m/%d/%Y")
-                except ValueError:
-                    try:
-                        end_date = datetime.strptime(end_date_str, "%m/%d/%y")
-                    except ValueError:
-                        end_date = datetime.now()  # Fallback
-                
+                start_date = self._parse_date(start_date_str)
+                end_date = self._parse_date(end_date_str)
+                if start_date is None:
+                    self._errors.append(
+                        f"statement period start date {start_date_str!r} was not a "
+                        f"date this parser recognises")
+                if end_date is None:
+                    self._errors.append(
+                        f"statement period end date {end_date_str!r} was not a "
+                        f"date this parser recognises")
                 return Period(start=start_date, end=end_date)
-        
-        # Fallback to current month if no period found
-        today = datetime.now()
-        start_date = datetime(today.year, today.month, 1)
-        return Period(start=start_date, end=today)
+
+        # No period found. Returning the current month here would be a guess
+        # presented as a reading, and every downstream date would inherit it.
+        self._errors.append("no statement period found")
+        return Period(start=None, end=None)
+
+    @staticmethod
+    def _statement_year(period: Period) -> Optional[int]:
+        """
+        The year to assume for transaction dates written as MM/DD.
+
+        Taken from the statement period, never from the clock. Using
+        datetime.now().year meant a January 2025 statement parsed in 2026 came
+        back with every transaction dated 2026, wrong in the direction nobody
+        checks. Returns None when the period is unknown, and the caller drops
+        the row rather than guessing.
+        """
+        anchor = period.end or period.start
+        return anchor.year if anchor else None
+
+    @staticmethod
+    def _parse_date(value: str) -> Optional[datetime]:
+        """Parse a date string, or return None. Never guess."""
+        for fmt in ("%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y"):
+            try:
+                return datetime.strptime(value, fmt)
+            except ValueError:
+                continue
+        return None
     
     def _extract_balance(self, text: str, institution: str, statement_type: str) -> Balance:
         """
@@ -369,7 +438,10 @@ class StatementParser:
                 rf"(?i)statement\s+balance:?\s+({amount_pattern})",
             ])
         
-        closing_balance = 0.0
+        # None rather than 0.0. A statement that genuinely closed at zero and a
+        # statement this parser could not read are different facts, and a
+        # reconciliation that cannot tell them apart is worse than no answer.
+        closing_balance = None
         for pattern in closing_patterns:
             match = re.search(pattern, text)
             if match:
@@ -394,9 +466,12 @@ class StatementParser:
                 opening_balance = float(amount_str.replace('$', '').replace(',', ''))
                 break
         
+        if closing_balance is None:
+            self._errors.append("no closing balance found")
         return Balance(closing=closing_balance, opening=opening_balance)
     
-    def _extract_transactions(self, text: str, institution: str, statement_type: str) -> List[Transaction]:
+    def _extract_transactions(self, text: str, institution: str, statement_type: str,
+                              period: Period) -> List[Transaction]:
         """
         Extract transaction list from the statement.
         
@@ -412,22 +487,6 @@ class StatementParser:
         Returns:
             List of Transaction objects containing parsed transactions
         """
-        # Transaction category patterns
-        category_patterns = {
-            'dining': r'(?i)restaurant|dining|food|cafe|coffee|starbucks|mcdonalds|chipotle|pizza|burger|taco|sushi',
-            'grocery': r'(?i)grocery|groceries|supermarket|market|food|whole foods|trader|safeway|kroger|albertsons|wegmans|publix',
-            'transportation': r'(?i)uber|lyft|taxi|cab|transport|transit|metro|subway|train|bus|airline|flight|gas|fuel|chevron|shell|exxon',
-            'shopping': r'(?i)amazon|ebay|walmart|target|costco|shop|store|retail|outlet|mall|clothing|apparel',
-            'utilities': r'(?i)utility|utilities|electric|water|gas|power|energy|cable|internet|phone|mobile|wireless|verizon|at&t|t-mobile',
-            'entertainment': r'(?i)netflix|hulu|spotify|apple|google|movie|theater|cinema|concert|ticket|entertainment',
-            'health': r'(?i)medical|doctor|pharmacy|drug|health|healthcare|hospital|clinic|dental|vision|insurance',
-            'personal': r'(?i)salon|spa|beauty|barber|hair|nail|gym|fitness',
-            'home': r'(?i)home|apartment|rent|lease|mortgage|furniture|decor|improvement|repair|maintenance',
-            'subscription': r'(?i)subscription|recurring|monthly|annual|membership|prime|fee',
-            'income': r'(?i)deposit|direct deposit|salary|payroll|payment received|income|revenue',
-            'transfer': r'(?i)transfer|zelle|venmo|paypal|cash app|wire|ach',
-            'withdrawal': r'(?i)withdrawal|atm|cash'
-        }
         transactions = []
         
         # Try to find the transactions section using common headers
@@ -455,9 +514,13 @@ class StatementParser:
             for match in re.finditer(tx_pattern, transaction_section):
                 date_str, description, amount_str = match.groups()
                 
-                # Parse date (assuming current year)
-                current_year = datetime.now().year
-                date = datetime.strptime(f"{date_str}/{current_year}", "%m/%d/%Y")
+                year = self._statement_year(period)
+                if year is None:
+                    self._errors.append(
+                        f"skipped transaction {date_str!r} {description.strip()!r}: the "
+                        f"date carries no year and the statement period is unknown")
+                    continue
+                date = datetime.strptime(f"{date_str}/{year}", "%m/%d/%Y")
                 
                 # Parse amount
                 amount = float(amount_str.replace('$', '').replace(',', ''))
@@ -538,9 +601,12 @@ class StatementParser:
                                 except ValueError:
                                     date = datetime.strptime(date_str, "%m/%d/%y")
                             else:
-                                # No year, assume current year
-                                current_year = datetime.now().year
-                                date = datetime.strptime(f"{date_str}/{current_year}", "%m/%d/%Y")
+                                year = self._statement_year(period)
+                                if year is None:
+                                    raise ValueError(
+                                        "date carries no year and the statement "
+                                        "period is unknown")
+                                date = datetime.strptime(f"{date_str}/{year}", "%m/%d/%Y")
                         else:
                             # Handle dashes
                             if len(date_str.split('-')) > 2:
@@ -550,13 +616,19 @@ class StatementParser:
                                 except ValueError:
                                     date = datetime.strptime(date_str, "%m-%d-%y")
                             else:
-                                # No year, assume current year
-                                current_year = datetime.now().year
-                                date = datetime.strptime(f"{date_str}-{current_year}", "%m-%d-%Y")
+                                year = self._statement_year(period)
+                                if year is None:
+                                    raise ValueError(
+                                        "date carries no year and the statement "
+                                        "period is unknown")
+                                date = datetime.strptime(f"{date_str}-{year}", "%m-%d-%Y")
                                 
-                    except ValueError:
-                        # If date parsing fails, use today's date as fallback
-                        date = datetime.now()
+                    except ValueError as e:
+                        # Dropping the row beats stamping it with today. A
+                        # transaction dated now is indistinguishable from a real
+                        # one and quietly corrupts every downstream total.
+                        self._errors.append(f"skipped transaction {date_str!r}: {e}")
+                        continue
                     
                     # Parse amount
                     amount_str = amount_str.replace('$', '').replace(',', '')
@@ -595,32 +667,41 @@ class StatementParser:
             Dictionary of confidence scores for each component and overall
         """
         confidence = {}
-        
-        # Account info confidence
-        confidence["account_info"] = 0.9 if account_info.number != "Unknown" else 0.3
-        
-        # Period confidence
-        today = datetime.now()
-        is_default_period = (period.start.year == today.year and 
-                            period.start.month == today.month and 
-                            period.start.day == 1)
-        confidence["period"] = 0.3 if is_default_period else 0.9
-        
-        # Balance confidence
-        confidence["balance"] = 0.8 if balance.opening is not None else 0.5
-        
-        # Transaction confidence based on count
-        if len(transactions) > 0:
-            confidence["transactions"] = min(0.9, 0.3 + (len(transactions) * 0.02))
+
+        # Every score below reflects what was actually read. The previous version
+        # scored a fabricated 0.00 closing balance at 0.8, and scored thirty
+        # transactions all stamped with today's date at 0.9, because the score
+        # was a count rather than a measure of what was known.
+        # 0.0 rather than 0.3 when the number was never found, so the invariant
+        # holds across every field: nothing read means no confidence.
+        confidence["account_info"] = 0.9 if account_info.number != "Unknown" else 0.0
+
+        if period.start is None or period.end is None:
+            confidence["period"] = 0.0
         else:
-            confidence["transactions"] = 0.1
-        
-        # Overall confidence (weighted average)
-        confidence["overall"] = (confidence["account_info"] + 
-                                confidence["period"] + 
-                                confidence["balance"] + 
-                                confidence["transactions"]) / 4
-        
+            confidence["period"] = 0.9
+
+        if balance.closing is None:
+            # Nothing was read. Not a zero balance, no balance.
+            confidence["balance"] = 0.0
+        elif balance.opening is None:
+            confidence["balance"] = 0.6
+        else:
+            confidence["balance"] = 0.9
+
+        if not transactions:
+            confidence["transactions"] = 0.0
+        else:
+            # Count alone says nothing about correctness, so cap it and let the
+            # dropped-row count in parse_errors carry the real signal.
+            base = min(0.9, 0.4 + len(transactions) * 0.02)
+            dropped = sum(1 for e in self._errors if e.startswith("skipped transaction"))
+            kept = len(transactions)
+            confidence["transactions"] = round(base * (kept / (kept + dropped)), 2)
+
+        confidence["overall"] = round(
+            sum(confidence[k] for k in ("account_info", "period", "balance", "transactions")) / 4, 2)
+
         return confidence
         
     def _categorize_transaction(self, description: str) -> Optional[str]:
