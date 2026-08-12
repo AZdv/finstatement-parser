@@ -636,7 +636,16 @@ class StatementParser:
         sep = '-' if '-' in token else '/'
         parts = token.split(sep)
         if len(parts) == 3:
-            return self._parse_date(token.replace('-', '/'))
+            parsed = self._parse_date(token.replace('-', '/'))
+            if parsed is None:
+                return None
+            # A full date was previously trusted outright, so a dated line from
+            # a summary block or a prior period could enter the transaction list
+            # unchallenged. The period is the authority here as much as it is
+            # for MM/DD.
+            if period.start and period.end and not (period.start <= parsed <= period.end):
+                return None
+            return parsed
         if len(parts) == 2:
             return self._resolve_md(token, period, sep)
         return None

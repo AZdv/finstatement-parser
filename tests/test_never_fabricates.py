@@ -207,3 +207,58 @@ def test_batch_parse_reports_every_input_including_failures():
     finally:
         for p in paths[:2]:
             os.unlink(p)
+
+
+# --- gaps a final pre-publication review found -------------------------------
+
+def test_bare_amounts_are_flagged_as_unsigned(parser):
+    """The README teaches callers to sum tx.amount. On layouts that print
+    charges unsigned that would be silently wrong, so the flag has to be set."""
+    period = Period(datetime(2025, 1, 1), datetime(2025, 1, 31))
+    txs = parser._extract_transactions(
+        "TRANSACTIONS\n01/15 SOME MERCHANT 1,234.56\n", "chase", "credit_card", period)
+    assert len(txs) == 1
+    assert txs[0].sign_explicit is False, "a bare figure must not look signed"
+
+
+def test_signed_amounts_are_flagged_as_signed(parser):
+    period = Period(datetime(2025, 1, 1), datetime(2025, 1, 31))
+    txs = parser._extract_transactions(
+        "TRANSACTIONS\n01/15 REFUND -$40.00\n", "chase", "credit_card", period)
+    assert txs[0].sign_explicit is True
+    assert txs[0].amount == pytest.approx(-40.00)
+
+
+def test_full_dates_outside_the_period_are_rejected(parser):
+    """A full date used to bypass the period check entirely, so a line from a
+    summary block or a prior statement could enter the transaction list."""
+    period = Period(datetime(2025, 1, 1), datetime(2025, 1, 31))
+    txs = parser._extract_transactions(
+        "TRANSACTIONS\n06/15/2019 ANCIENT CHARGE $10.00\n01/15/2025 REAL ONE $20.00\n",
+        "bofa", "bank", period)
+    assert [t.description for t in txs] == ["REAL ONE"]
+
+
+def test_file_size_bound_is_enforced(parser, monkeypatch, tmp_path):
+    """The README promises a 50 MB bound. Promised is not the same as tested."""
+    from finstatement import parser as parser_module
+    monkeypatch.setattr(parser_module, "MAX_FILE_BYTES", 10)
+    big = tmp_path / "big.pdf"
+    big.write_bytes(b"x" * 100)
+    with pytest.raises(StatementParseError, match="over the"):
+        StatementParser().parse(str(big))
+
+
+def test_page_count_bound_is_enforced(monkeypatch, tmp_path):
+    """The README promises a 500-page bound."""
+    reportlab = pytest.importorskip("reportlab.pdfgen.canvas")
+    from finstatement import parser as parser_module
+    monkeypatch.setattr(parser_module, "MAX_PAGES", 2)
+    path = tmp_path / "many.pdf"
+    c = reportlab.Canvas(str(path))
+    for _ in range(4):
+        c.drawString(100, 700, "page")
+        c.showPage()
+    c.save()
+    with pytest.raises(StatementParseError, match="page limit"):
+        StatementParser().parse(str(path))

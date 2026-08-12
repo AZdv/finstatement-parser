@@ -39,7 +39,8 @@ def create_sample_result():
     """Create a sample result for demo purposes"""
     return finstatement.StatementResult(
         account_info=finstatement.AccountInfo(
-            number="xxxx-xxxx-xxxx-1234",
+            number="1234",
+            number_is_partial=True,
             institution="chase",
             type="credit_card"
         ),

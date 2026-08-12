@@ -62,7 +62,8 @@ print(f"Closing Balance: ${result.balance.closing:.2f}")
 
 # Get transactions
 for tx in result.transactions:
-    print(f"{tx.date.strftime('%m/%d/%Y')} | ${tx.amount:.2f} | {tx.description}")
+    sign = "" if tx.sign_explicit else "  (sign not printed on the statement)"
+    print(f"{tx.date.strftime('%m/%d/%Y')} | ${tx.amount:.2f} | {tx.description}{sign}")
 
 # Export as standardized JSON
 json_data = result.to_json()
@@ -133,7 +134,10 @@ for tx in result.transactions:
 # Calculate spending by category
 category_totals = {}
 for category, transactions in by_category.items():
-    category_totals[category] = sum(tx.amount for tx in transactions)
+    # Only meaningful when the statement printed signs. See "Amount signs are
+    # read, never inferred" above.
+    signed = [tx for tx in transactions if tx.sign_explicit]
+    category_totals[category] = sum(tx.amount for tx in signed)
     
 # Print summary
 for category, total in sorted(category_totals.items(), key=lambda x: x[1]):
@@ -225,6 +229,31 @@ if result.parse_errors:
 if result.balance.closing is None:
     ...  # not zero. unknown.
 ```
+
+### Amount signs are read, never inferred
+
+`Transaction.amount` carries a sign only when the statement printed one.
+`Transaction.sign_explicit` tells you which case you are in.
+
+```python
+for tx in result.transactions:
+    if not tx.sign_explicit:
+        ...  # the statement printed a bare figure. Direction is unknown.
+```
+
+This matters because many layouts put charges and credits in separate columns,
+and those columns flatten into one text run when the PDF is converted. A bare
+`1,234.56` on such a statement could be either. An earlier version guessed, and
+guessed differently per institution: Amex charges were forced negative by a
+branch that returned already-negative values unchanged, so charges and credits
+came out with the same sign and a month of charges plus an equal payment netted
+to double the charges instead of zero.
+
+So **do not sum `amount` across transactions where `sign_explicit` is `False`**
+without deciding direction yourself from the column layout or the statement
+type. Summing a mixed set will be wrong, quietly. If you need a single figure
+and the signs are not explicit, reconcile against `balance.closing` instead and
+treat a mismatch as a parse failure rather than as arithmetic.
 
 Untrusted PDFs are bounded: 50 MB and 500 pages by default, and an encrypted
 file that will not open with an empty password raises rather than returning
