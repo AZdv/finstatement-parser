@@ -15,7 +15,10 @@ import json
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from typing import List, Optional, Dict, Any
-import PyPDF2  # For PDF text extraction
+try:
+    import pypdf  # maintained successor to PyPDF2
+except ImportError:  # pragma: no cover
+    import PyPDF2 as pypdf  # last resort, EOL and unpatched
 
 # Guardrails for untrusted input. A statement parser is pointed at files that
 # arrived by email, so an unbounded PdfReader call is a denial of service
@@ -68,6 +71,9 @@ class Transaction:
     date: datetime
     description: str
     amount: float
+    # False when the statement printed a bare figure with no sign. Direction is
+    # then unknown from the line alone and must not be assumed by the caller.
+    sign_explicit: bool = True
     balance: Optional[float] = None
     category: Optional[str] = None
     
@@ -209,7 +215,12 @@ class StatementParser:
         Returns:
             Extracted text content as a string
         """
-        size = os.path.getsize(file_path)
+        try:
+            size = os.path.getsize(file_path)
+        except OSError as e:
+            # This sat outside the try, so a missing path raised
+            # FileNotFoundError while the README promised StatementParseError.
+            raise StatementParseError(f"could not open {file_path}: {e}") from e
         if size > MAX_FILE_BYTES:
             raise StatementParseError(
                 f"{file_path} is {size} bytes, over the {MAX_FILE_BYTES} byte limit")
@@ -218,7 +229,7 @@ class StatementParser:
         page_errors = []
         try:
             with open(file_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
+                pdf_reader = pypdf.PdfReader(file)
 
                 if pdf_reader.is_encrypted:
                     # An empty password covers the common case of a statement
@@ -451,14 +462,18 @@ class StatementParser:
             Balance object with opening and closing balances
         """
         # Pattern for currency amounts
-        amount_pattern = r'[\$]?[\d,]+\.\d{2}'
+        # Wide enough to capture the sign wherever the statement puts it, and
+        # guarded at the end so 1,234.5678 is not silently truncated to 1,234.56.
+        # The old pattern read "1,234.56-" as positive and could not read
+        # "-$1,234.56" or "($1,234.56)" at all, so an overdraft came back as
+        # "no closing balance found".
+        amount_pattern = r'\(?[-+]?\$?-?[\d,]+\.\d{2}\)?-?(?![\d])'
         
         # Look for closing balance patterns based on statement type
         closing_patterns = [
             rf"(?i)closing\s+balance:?\s+({amount_pattern})",
             rf"(?i)ending\s+balance:?\s+({amount_pattern})",
             rf"(?i)new\s+balance:?\s+({amount_pattern})",
-            rf"(?i)balance\s+forward:?\s+({amount_pattern})",
         ]
         
         # For credit cards, add more specific patterns
@@ -478,7 +493,10 @@ class StatementParser:
             if match:
                 # Extract and clean the amount string
                 amount_str = match.group(1)
-                closing_balance = float(amount_str.replace('$', '').replace(',', ''))
+                parsed = self._parse_amount(amount_str)
+                if parsed is None:
+                    continue
+                closing_balance = parsed[0]
                 break
         
         # Look for opening balance patterns
@@ -486,6 +504,9 @@ class StatementParser:
             rf"(?i)opening\s+balance:?\s+({amount_pattern})",
             rf"(?i)previous\s+balance:?\s+({amount_pattern})",
             rf"(?i)beginning\s+balance:?\s+({amount_pattern})",
+            # Balance forward is what carries in from the prior period, so it is
+            # an opening figure. It was previously read as the closing balance.
+            rf"(?i)balance\s+forward:?\s+({amount_pattern})",
             rf"(?i)balance\s+(?:from|as of)\s+last\s+statement:?\s+({amount_pattern})",
         ]
         
@@ -494,191 +515,132 @@ class StatementParser:
             match = re.search(pattern, text)
             if match:
                 amount_str = match.group(1)
-                opening_balance = float(amount_str.replace('$', '').replace(',', ''))
+                parsed = self._parse_amount(amount_str)
+                if parsed is None:
+                    continue
+                opening_balance = parsed[0]
                 break
         
         if closing_balance is None:
             self._errors.append("no closing balance found")
+        if opening_balance is None:
+            self._errors.append("no opening balance found")
         return Balance(closing=closing_balance, opening=opening_balance)
     
+    # Amounts as they appear on US statements. Ordered longest-first so the
+    # parenthesised and trailing-minus forms win before the bare form matches
+    # their inner digits.
+    _AMOUNT_FORMS = [
+        (re.compile(r'^\((\$?[\d,]+\.\d{2})\)$'), -1),      # (1,234.56)  accounting negative
+        (re.compile(r'^-\$?([\d,]+\.\d{2})$'), -1),          # -$1,234.56
+        (re.compile(r'^\$-([\d,]+\.\d{2})$'), -1),           # $-1,234.56
+        (re.compile(r'^\$?([\d,]+\.\d{2})-$'), -1),          # 1,234.56-   trailing minus
+        (re.compile(r'^\+\$?([\d,]+\.\d{2})$'), 1),          # +$1,234.56
+        (re.compile(r'^\$?([\d,]+\.\d{2})$'), 0),            # 1,234.56    no explicit sign
+    ]
+
+    # A date at the start of a line. No \s inside any class, so there is no
+    # lazy-class-then-\s+ backtracking path. The previous patterns took cubic
+    # time and ~2KB of whitespace after a date token could pin a core.
+    _LINE_DATE = re.compile(r'^\s*(\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)\s+(.*)$')
+
+    @classmethod
+    def _parse_amount(cls, token: str):
+        """
+        Return (value, sign_explicit) or None.
+
+        sign_explicit is False when the statement wrote a bare figure. Direction
+        is then genuinely unknown from the line alone, because many layouts put
+        charges and credits in separate columns that flatten into one text run.
+        The earlier code guessed, and guessed inconsistently by institution: Amex
+        charges were forced negative by a branch that returned an already
+        negative value unchanged, so charges and credits ended up with the same
+        sign and a month of charges plus an equal payment netted to double the
+        charges instead of zero.
+        """
+        token = token.strip()
+        for pattern, sign in cls._AMOUNT_FORMS:
+            m = pattern.match(token)
+            if not m:
+                continue
+            try:
+                value = float(m.group(1).replace('$', '').replace(',', ''))
+            except ValueError:
+                return None
+            if sign == 0:
+                return value, False
+            return value * sign, True
+        return None
+
     def _extract_transactions(self, text: str, institution: str, statement_type: str,
                               period: Period) -> List[Transaction]:
         """
-        Extract transaction list from the statement.
-        
-        This method uses institution-specific patterns where available, falling back
-        to generic patterns for unknown institutions. It also attempts to categorize
-        transactions based on their descriptions.
-        
-        Args:
-            text: Extracted text content
-            institution: Detected institution identifier
-            statement_type: Detected statement type
-            
-        Returns:
-            List of Transaction objects containing parsed transactions
+        Extract transactions, one line at a time.
+
+        Line-anchored on purpose. The previous implementation used patterns whose
+        description class contained \\s, which matches newlines, so a match could
+        span arbitrary line breaks. It assembled transactions that did not exist:
+        a date from one line, a description from two others and an amount from a
+        fourth, returned with a category and an empty parse_errors. Anchoring per
+        line makes that impossible rather than unlikely.
         """
         transactions = []
-        
-        # Try to find the transactions section using common headers
-        transaction_headers = [
-            r'(?i)transactions?',
-            r'(?i)account\s+activity',
-            r'(?i)payments\s+and\s+(?:other\s+)?credits',
-            r'(?i)purchases\s+and\s+(?:other\s+)?charges',
-        ]
-        
-        # Try to find transaction section boundaries
-        transaction_section = text
-        for header in transaction_headers:
-            # Look for the transactions section followed by common section endings
-            match = re.search(f"{header}.*?(?=SUMMARY|TOTAL|BALANCE|STATEMENT|INFORMATION|$)", 
-                             text, re.DOTALL | re.IGNORECASE)
-            if match:
-                transaction_section = match.group(0)
-                break
-        
-        # Different formats for different institutions
-        if institution == "chase" and statement_type == "credit_card":
-            # Chase credit card format: DATE DESCRIPTION AMOUNT
-            tx_pattern = r'(\d{2}/\d{2})\s+([A-Za-z0-9\s.,&\'"-]+?)\s+([-+]?\$[\d,]+\.\d{2})'
-            for match in re.finditer(tx_pattern, transaction_section):
-                date_str, description, amount_str = match.groups()
-                
-                date = self._resolve_md(date_str, period)
-                if date is None:
-                    self._errors.append(
-                        f"skipped transaction {date_str!r} {description.strip()!r}: the "
-                        f"date carries no year and could not be placed unambiguously "
-                        f"inside the statement period")
-                    continue
-                
-                # Parse amount
-                amount = float(amount_str.replace('$', '').replace(',', ''))
-                
-                # Add transaction
-                transactions.append(Transaction(
-                    date=date,
-                    description=description.strip(),
-                    amount=amount
-                ))
-        elif institution == "bofa" and statement_type == "bank":
-            # Bank of America checking format
-            tx_pattern = r'(\d{2}/\d{2}/\d{2,4})\s+([A-Za-z0-9\s.,&\'"-]+?)\s+([-+]?\$[\d,]+\.\d{2})'
-            for match in re.finditer(tx_pattern, transaction_section):
-                date_str, description, amount_str = match.groups()
-                
-                # Parse date
-                try:
-                    date = datetime.strptime(date_str, "%m/%d/%Y")
-                except ValueError:
-                    date = datetime.strptime(date_str, "%m/%d/%y")
-                
-                # Parse amount
-                amount = float(amount_str.replace('$', '').replace(',', ''))
-                
-                # Add transaction
-                transactions.append(Transaction(
-                    date=date,
-                    description=description.strip(),
-                    amount=amount
-                ))
-        elif institution == "amex" and statement_type == "credit_card":
-            # American Express format
-            tx_pattern = r'(\d{2}/\d{2}/\d{2,4})\s+([A-Za-z0-9\s.,&\'"-]+?)\s+([-+]?\$[\d,]+\.\d{2})'
-            for match in re.finditer(tx_pattern, transaction_section):
-                date_str, description, amount_str = match.groups()
-                
-                # Parse date
-                try:
-                    date = datetime.strptime(date_str, "%m/%d/%Y")
-                except ValueError:
-                    date = datetime.strptime(date_str, "%m/%d/%y")
-                
-                # Parse amount (Amex typically shows charges as positive)
-                amount_str = amount_str.replace('$', '').replace(',', '')
-                amount = -float(amount_str) if not amount_str.startswith('-') else float(amount_str)
-                
-                # Add transaction
-                transactions.append(Transaction(
-                    date=date,
-                    description=description.strip(),
-                    amount=amount
-                ))
-        else:
-            # Generic approach for other statement types
-            # Looking for date-like strings followed by description and amount
-            date_patterns = [
-                r'(\d{1,2}/\d{1,2}(?:/\d{2,4})?)',  # MM/DD or MM/DD/YYYY
-                r'(\d{1,2}-\d{1,2}(?:-\d{2,4})?)',  # MM-DD or MM-DD-YYYY
-            ]
-            
-            amount_pattern = r'([-+]?\$?[\d,]+\.\d{2})'
-            
-            for date_pattern in date_patterns:
-                # Look for pattern: DATE DESCRIPTION AMOUNT
-                combined_pattern = f"{date_pattern}\\s+([A-Za-z0-9\\s.,&'\"()-]+?)\\s+{amount_pattern}"
-                for match in re.finditer(combined_pattern, transaction_section):
-                    date_str, description, amount_str = match.groups()
-                    
-                    # Parse date
-                    try:
-                        # Try different date formats
-                        if '/' in date_str:
-                            if len(date_str.split('/')) > 2:
-                                # Has year component
-                                try:
-                                    date = datetime.strptime(date_str, "%m/%d/%Y")
-                                except ValueError:
-                                    date = datetime.strptime(date_str, "%m/%d/%y")
-                            else:
-                                date = self._resolve_md(date_str, period, "/")
-                                if date is None:
-                                    raise ValueError(
-                                        "date carries no year and could not be placed "
-                                        "inside the statement period")
-                        else:
-                            # Handle dashes
-                            if len(date_str.split('-')) > 2:
-                                # Has year component
-                                try:
-                                    date = datetime.strptime(date_str, "%m-%d-%Y")
-                                except ValueError:
-                                    date = datetime.strptime(date_str, "%m-%d-%y")
-                            else:
-                                date = self._resolve_md(date_str, period, "-")
-                                if date is None:
-                                    raise ValueError(
-                                        "date carries no year and could not be placed "
-                                        "inside the statement period")
-                                
-                    except ValueError as e:
-                        # Dropping the row beats stamping it with today. A
-                        # transaction dated now is indistinguishable from a real
-                        # one and quietly corrupts every downstream total.
-                        self._errors.append(f"skipped transaction {date_str!r}: {e}")
-                        continue
-                    
-                    # Parse amount
-                    amount_str = amount_str.replace('$', '').replace(',', '')
-                    try:
-                        amount = float(amount_str)
-                    except ValueError:
-                        continue  # Skip if amount can't be parsed
-                    
-                    # Categorize transaction
-                    category = self._categorize_transaction(description.strip())
-                    
-                    # Add transaction
-                    transactions.append(Transaction(
-                        date=date,
-                        description=description.strip(),
-                        amount=amount,
-                        category=category
-                    ))
-        
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith('---'):
+                continue
+
+            m = self._LINE_DATE.match(line)
+            if not m:
+                continue
+            date_str, remainder = m.group(1), m.group(2).strip()
+            if not remainder:
+                continue
+
+            # The amount is the last whitespace-separated token on the line.
+            parts = remainder.rsplit(None, 1)
+            if len(parts) != 2:
+                continue
+            description, amount_token = parts
+            description = description.strip(' .:\t')
+            if not description:
+                continue
+
+            parsed = self._parse_amount(amount_token)
+            if parsed is None:
+                continue  # not a transaction line, e.g. a column header
+            amount, sign_explicit = parsed
+
+            date = self._resolve_date_token(date_str, period)
+            if date is None:
+                self._errors.append(
+                    f"skipped transaction {date_str!r} {description[:40]!r}: the date "
+                    f"could not be placed unambiguously inside the statement period")
+                continue
+
+            transactions.append(Transaction(
+                date=date,
+                description=description,
+                amount=amount,
+                sign_explicit=sign_explicit,
+                category=self._categorize_transaction(description),
+            ))
+
+        if not transactions:
+            self._errors.append("no transactions found")
         return transactions
-    
+
+    def _resolve_date_token(self, token: str, period: Period) -> Optional[datetime]:
+        """Resolve a date token that may or may not carry a year."""
+        sep = '-' if '-' in token else '/'
+        parts = token.split(sep)
+        if len(parts) == 3:
+            return self._parse_date(token.replace('-', '/'))
+        if len(parts) == 2:
+            return self._resolve_md(token, period, sep)
+        return None
+
     def _calculate_confidence(self, account_info, period, balance, transactions) -> Dict[str, float]:
         """
         Calculate confidence scores for extracted data.
@@ -778,39 +740,36 @@ def parse(file_path: str, debug: bool = False) -> StatementResult:
     parser = StatementParser()
     return parser.parse(file_path)
 
-def batch_parse(file_paths: List[str], parallel: bool = True, max_workers: int = None) -> Dict[str, StatementResult]:
+def batch_parse(file_paths: List[str], parallel: bool = True,
+                max_workers: int = None) -> Dict[str, Any]:
     """
-    Parse multiple statement PDFs in batch, optionally in parallel.
-    
-    Args:
-        file_paths: List of paths to PDF statement files
-        parallel: If True, process files in parallel
-        max_workers: Maximum number of parallel workers (defaults to CPU count)
-        
-    Returns:
-        Dictionary mapping file paths to their corresponding StatementResult objects
+    Parse many statements. Every input appears in the result.
+
+    Failures used to be caught, printed to stdout and omitted from the returned
+    dict, so four inputs could return one result with no programmatic signal
+    that three had gone. For a reconciliation job that is worse than a crash,
+    because it is invisible. Failures now come back as the StatementParseError
+    instance keyed by the same path, so isinstance(v, StatementParseError)
+    separates them and no input is ever silently absent.
     """
-    results = {}
-    
-    if parallel:
+    results: Dict[str, Any] = {}
+
+    def run(path):
+        try:
+            return path, StatementParser().parse(path)
+        except StatementParseError as e:
+            return path, e
+        except Exception as e:  # a parser bug must not vanish either
+            return path, StatementParseError(f"unexpected failure on {path}: {e}")
+
+    if parallel and len(file_paths) > 1:
         import concurrent.futures
-        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all parsing tasks
-            future_to_path = {executor.submit(parse, path): path for path in file_paths}
-            
-            # Collect results as they complete
-            for future in concurrent.futures.as_completed(future_to_path):
-                path = future_to_path[future]
-                try:
-                    results[path] = future.result()
-                except Exception as e:
-                    print(f"Error processing {path}: {e}")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for path, outcome in pool.map(run, file_paths):
+                results[path] = outcome
     else:
-        # Process sequentially
         for path in file_paths:
-            try:
-                results[path] = parse(path)
-            except Exception as e:
-                print(f"Error processing {path}: {e}")
-    
+            _, outcome = run(path)
+            results[path] = outcome
+
     return results

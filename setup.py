@@ -6,11 +6,13 @@ setup(
     description="Financial statement PDF parser",
     author="AZdev",
     author_email="info@azdv.co",
-    url="https://github.com/azdv/finstatement-parser",
+    url="https://github.com/AZdv/finstatement-parser",
     packages=find_packages(),
+    extras_require={
+        "dev": ["pytest>=7.0", "reportlab>=3.6.0"],
+    },
     install_requires=[
-        "PyPDF2>=2.0.0",
-        "reportlab>=3.6.0",  # For sample generator
+        "pypdf>=5.0.0",
     ],
     python_requires=">=3.7",
     classifiers=[

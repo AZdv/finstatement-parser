@@ -82,12 +82,27 @@ def create_sample_result():
 
 def print_summary(result):
     """Print a summary of the parsing results"""
+    def money(value):
+        return "not read" if value is None else f"${value:,.2f}"
+
+    def day(value):
+        return "not read" if value is None else value.strftime("%B %d, %Y")
+
+    # Every field here can legitimately be None. This demo used to assume
+    # otherwise and died with an AttributeError on exactly the statements the
+    # README is written to celebrate, which is the worst place to crash.
     print(f"\n=== Statement Summary ===")
-    print(f"Account: {result.account_info.number} ({result.account_info.institution})")
-    print(f"Period: {result.period.start.strftime('%B %d, %Y')} to {result.period.end.strftime('%B %d, %Y')}")
-    print(f"Opening Balance: ${result.balance.opening:.2f}" if result.balance.opening is not None else "Opening Balance: N/A")
-    print(f"Closing Balance: ${result.balance.closing:.2f}")
+    print(f"Account: {result.account_info.number or 'not read'} "
+          f"({result.account_info.institution or 'unknown institution'})")
+    print(f"Period: {day(result.period.start)} to {day(result.period.end)}")
+    print(f"Opening Balance: {money(result.balance.opening)}")
+    print(f"Closing Balance: {money(result.balance.closing)}")
     print(f"Transaction Count: {len(result.transactions)}")
+
+    if result.parse_errors:
+        print("\n=== Could not be read ===")
+        for problem in result.parse_errors:
+            print(f"  {problem}")
     
     # Print confidence scores
     if result.confidence:

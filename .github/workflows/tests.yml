@@ -1,0 +1,25 @@
+name: tests
+
+# The point of this workflow is narrow: the library claims it does not invent
+# financial data, and every test in tests/ corresponds to a defect that shipped
+# publicly. Without this, each round of fixes was verified by hand and the next
+# reviewer found a regression.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest tests/ -q
